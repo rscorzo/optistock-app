@@ -566,7 +566,7 @@ with tab_expiry:
     total_on_hand_units = results_df["Total_On_Hand_Units"].sum()
     exp_0_30_units = results_df["Expiring_0_30_Units"].sum()
     exp_31_90_units = results_df["Expiring_31_90_Units"].sum()
-    exp_>90_units = results_df["Expiring_>90_Units"].sum()
+    exp_gt_90_units = results_df["Expiring_>90_Units"].sum()
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total On-hand Units", f"{total_on_hand_units:,.0f}")
@@ -578,7 +578,7 @@ with tab_expiry:
         pd.DataFrame(
             {
                 "Bucket": ["0–30 days", "31–90 days", ">90 days"],
-                "Units": [exp_0_30_units, exp_31_90_units, exp_>90_units],
+                "Units": [exp_0_30_units, exp_31_90_units, exp_gt_90_units],
             }
         )
         .set_index("Bucket")
