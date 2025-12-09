@@ -3,163 +3,364 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 
-from prophet import Prophet
+# -------------------------
+# Helper functions
+# -------------------------
+
+def validate_columns(df: pd.DataFrame):
+    """Ensure required columns are present."""
+    required = [
+        "SKU",
+        "Date",
+        "Monthly_Demand",
+        "Lead_Time_Days",
+        "Shelf_Life_Days",
+        "Unit_Cost",
+        "On_Hand",
+        "Expiration_Date",
+        "Days_To_Expiry",
+        "Expiring_Soon_Flag",
+        "Inventory_Value",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    return missing
+
+def compute_light_forecast(df: pd.DataFrame):
+    """
+    Light forecasting model:
+    - For each SKU, use the last 6 months avg demand * 12 for 12M forecast.
+    - Safety stock based on std dev and lead time.
+    - Recommended production = max(0, forecast_12m + safety_stock - on_hand).
+    """
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+
+    sku_list = df["SKU"].unique()
+    results = []
+
+    for sku in sku_list:
+        sku_hist = df[df["SKU"] == sku].sort_values("Date")
+
+        # Demand series
+        demand = sku_hist["Monthly_Demand"].astype(float)
+
+        # Last 6 months average (fallback to overall mean if < 6 points)
+        if len(demand) >= 6:
+            avg_6 = demand.tail(6).mean()
+        else:
+            avg_6 = demand.mean()
+
+        forecast_12m_units = float(avg_6 * 12)
+
+        # Safety stock
+        lead_time_days = float(sku_hist["Lead_Time_Days"].iloc[0])
+        lead_time_months = max(lead_time_days / 30.0, 0.5)
+        sigma = float(demand.std()) if demand.std() > 0 else 1.0
+        Z = 1.65  # ~95% service level
+        safety_stock_units = int(Z * sigma * np.sqrt(lead_time_months))
+
+        # On-hand snapshot: last non-null On_Hand
+        sku_onhand = sku_hist[~sku_hist["On_Hand"].isna()]
+        if not sku_onhand.empty:
+            on_hand_units = float(sku_onhand["On_Hand"].iloc[-1])
+        else:
+            on_hand_units = 0.0
+
+        # Cost
+        unit_cost = float(sku_hist["Unit_Cost"].mean())
+
+        # Expiry risk metrics (aggregate over rows where On_Hand is not null)
+        exp_rows = sku_hist[~sku_hist["On_Hand"].isna()].copy()
+        if exp_rows.empty:
+            total_on_hand = 0.0
+            total_inv_value = 0.0
+            exp_0_30_units = 0.0
+            exp_31_90_units = 0.0
+            exp_gt_90_units = 0.0
+            exp_soon_units = 0.0
+            exp_soon_value = 0.0
+            min_days_to_expiry = np.nan
+        else:
+            total_on_hand = float(exp_rows["On_Hand"].sum())
+            total_inv_value = float(exp_rows["Inventory_Value"].sum())
+            min_days_to_expiry = float(exp_rows["Days_To_Expiry"].min())
+
+            exp_0_30_units = float(exp_rows.loc[exp_rows["Days_To_Expiry"] <= 30, "On_Hand"].sum())
+            exp_31_90_units = float(
+                exp_rows.loc[(exp_rows["Days_To_Expiry"] > 30) & (exp_rows["Days_To_Expiry"] <= 90), "On_Hand"].sum()
+            )
+            exp_gt_90_units = float(exp_rows.loc[exp_rows["Days_To_Expiry"] > 90, "On_Hand"].sum())
+
+            exp_soon_units = float(exp_rows.loc[exp_rows["Days_To_Expiry"] <= 90, "On_Hand"].sum())
+            exp_soon_value = float(exp_rows.loc[exp_rows["Days_To_Expiry"] <= 90, "Inventory_Value"].sum())
+
+        # Recommended production
+        recommended_prod_units = max(0, round(forecast_12m_units + safety_stock_units - on_hand_units))
+        recommended_prod_value = recommended_prod_units * unit_cost
+
+        # Simple inventory risk label
+        if total_on_hand == 0:
+            risk_label = "No Stock"
+        else:
+            exp_ratio = exp_soon_units / total_on_hand if total_on_hand > 0 else 0
+            if exp_ratio >= 0.5:
+                risk_label = "High Expiry Risk"
+            elif exp_ratio >= 0.2:
+                risk_label = "Moderate Expiry Risk"
+            else:
+                risk_label = "Low Expiry Risk"
+
+        # Try to capture a product family if present
+        product_family = sku_hist["Product_Family"].iloc[0] if "Product_Family" in sku_hist.columns else ""
+
+        results.append({
+            "SKU": sku,
+            "Product_Family": product_family,
+            "Lead_Time_Days": lead_time_days,
+            "Shelf_Life_Days": float(sku_hist["Shelf_Life_Days"].iloc[0]),
+            "Unit_Cost": unit_cost,
+
+            # Forecast & stock
+            "Forecast_12M_Units": round(forecast_12m_units),
+            "Forecast_12M_Value": round(forecast_12m_units * unit_cost, 2),
+            "Safety_Stock_Units": safety_stock_units,
+            "Safety_Stock_Value": round(safety_stock_units * unit_cost, 2),
+            "On_Hand_Units": round(on_hand_units),
+            "On_Hand_Value": round(on_hand_units * unit_cost, 2),
+
+            # Expiry metrics
+            "Total_On_Hand_Units": round(total_on_hand),
+            "Total_On_Hand_Value": round(total_inv_value, 2),
+            "Expiring_0_30_Units": round(exp_0_30_units),
+            "Expiring_31_90_Units": round(exp_31_90_units),
+            "Expiring_>90_Units": round(exp_gt_90_units),
+            "Expiring_Soon_Units_<=90": round(exp_soon_units),
+            "Expiring_Soon_Value_<=90": round(exp_soon_value, 2),
+            "Min_Days_To_Expiry": min_days_to_expiry,
+
+            # Recommendation
+            "Recommended_Production_Units": recommended_prod_units,
+            "Recommended_Production_Value": round(recommended_prod_value, 2),
+
+            # Risk label
+            "Inventory_Risk_Label": risk_label,
+        })
+
+    results_df = pd.DataFrame(results)
+    return results_df
+
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Convert dataframe to Excel bytes for download."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="OptiStock_Output")
+    return output.getvalue()
+
+# -------------------------
+# Streamlit App
+# -------------------------
 
 st.set_page_config(page_title="OptiStock – Inventory Optimization", layout="wide")
 
-st.title("OptiStock – AI Inventory Forecast & Production Planner")
+st.title("OptiStock – AI Inventory & Expiry Intelligence")
+
 st.write(
-    "Upload your inventory / demand dataset and OptiStock will forecast demand, "
-    "calculate safety stock, and recommend production levels by SKU."
+    "Upload your combined inventory & demand dataset and OptiStock will:\n"
+    "- Forecast demand (light model)\n"
+    "- Calculate safety stock\n"
+    "- Evaluate expiry risk\n"
+    "- Recommend production levels\n"
+    "- Highlight top SKUs by value and risk"
 )
 
-# --- File upload ---
+# ---- File upload (single file, used for all tabs) ----
 uploaded_file = st.file_uploader(
-    "Upload your synthetic inventory dataset (Excel)",
-    type=["xlsx", "xls"]
+    "Upload your combined OptiStock dataset (e.g., pharma_inventory_master_optistock.xlsx)",
+    type=["xlsx"]
 )
 
 if uploaded_file is None:
-    st.info("👆 Upload your synthetic file (e.g., `pharma_inventory_synthetic.xlsx`) to begin.")
+    st.info("👆 Please upload your combined dataset to begin.")
     st.stop()
 
-# --- Read data ---
+# Read and validate data
 try:
-    df = pd.read_excel(uploaded_file)
+    raw_df = pd.read_excel(uploaded_file)
 except Exception as e:
     st.error(f"Error reading file: {e}")
     st.stop()
 
-st.subheader("Preview of uploaded data")
-st.dataframe(df.head())
-
-st.write("Columns detected:", list(df.columns))
-
-required_cols = ["SKU", "Date", "Monthly_Demand", "Lead_Time_Days", "Shelf_Life_Days", "Unit_Cost"]
-missing = [c for c in required_cols if c not in df.columns]
-
-if missing:
-    st.error(f"❌ Missing required columns in dataset: {missing}")
+missing_cols = validate_columns(raw_df)
+if missing_cols:
+    st.error(f"❌ Missing required columns: {missing_cols}")
     st.stop()
 
-# Ensure Date is datetime
-df["Date"] = pd.to_datetime(df["Date"])
+# Ensure proper types
+raw_df["Date"] = pd.to_datetime(raw_df["Date"])
+raw_df["Expiration_Date"] = pd.to_datetime(raw_df["Expiration_Date"])
 
-# Button to run forecasting logic
-if not st.button("Run Forecasting & Generate Recommended Production"):
-    st.stop()
+# Run the light forecasting + expiry logic once
+results_df = compute_light_forecast(raw_df)
 
-st.success("Running forecasts and optimization... this may take a bit for many SKUs.")
+# Put in session_state for reuse (optional but nice)
+st.session_state["optistock_results"] = results_df
+st.session_state["optistock_raw"] = raw_df
 
-sku_list = df["SKU"].unique()
-forecasts = {}
-safety_stock = {}
-risk_flags = {}
+# -------------------------
+# TABS
+# -------------------------
 
-Z = 1.65  # approx 95% service level
-
-# --- Forecast + safety stock + risk flag per SKU ---
-for sku in sku_list:
-    sku_data = df[df["SKU"] == sku][["Date", "Monthly_Demand"]].rename(
-        columns={"Date": "ds", "Monthly_Demand": "y"}
-    )
-
-    # Basic Prophet model
-    model = Prophet(yearly_seasonality=True)
-    model.fit(sku_data)
-
-    future = model.make_future_dataframe(periods=12, freq="MS")
-    forecast = model.predict(future)
-
-    # keep last 12 months forecast
-    forecasts[sku] = forecast[["ds", "yhat"]].tail(12)
-
-    # Safety stock
-    lead_time = df[df["SKU"] == sku]["Lead_Time_Days"].iloc[0]
-    sigma = df[df["SKU"] == sku]["Monthly_Demand"].std()
-    if np.isnan(sigma) or sigma == 0:
-        sigma = 1  # avoid zero SS for static SKUs
-    safety_stock[sku] = int(Z * sigma * np.sqrt(lead_time / 30))
-
-    # Simple risk flag
-    shelf_life = df[df["SKU"] == sku]["Shelf_Life_Days"].iloc[0]
-    avg_demand = df[df["SKU"] == sku]["Monthly_Demand"].mean()
-    if shelf_life < 365 or avg_demand < 50:
-        risk_flags[sku] = "High Risk"
-    else:
-        risk_flags[sku] = "Low Risk"
-
-# --- Build results table ---
-results = []
-
-has_on_hand = "On_Hand" in df.columns
-
-for sku in sku_list:
-    forecast_12m = forecasts[sku]["yhat"].sum()
-    product_family = df[df["SKU"] == sku]["Product_Family"].iloc[0] if "Product_Family" in df.columns else ""
-    unit_cost = df[df["SKU"] == sku]["Unit_Cost"].iloc[0]
-
-    ss = safety_stock[sku]
-
-    # Use On_Hand if present, else assume 0 for now
-    if has_on_hand:
-        on_hand_val = df[df["SKU"] == sku]["On_Hand"].iloc[0]
-    else:
-        on_hand_val = 0
-
-    recommended_production_units = max(0, round(forecast_12m + ss - on_hand_val))
-
-    results.append({
-        "SKU": sku,
-        "Product_Family": product_family,
-        "On_Hand" if has_on_hand else "On_Hand (assumed 0)": on_hand_val,
-        "Forecast_12M": round(forecast_12m),
-        "Forecast_12M_Value": round(forecast_12m * unit_cost, 2),
-        "Safety_Stock": ss,
-        "Safety_Stock_Value": round(ss * unit_cost, 2),
-        "Inventory_Risk": risk_flags[sku],
-        "Recommended_Production": recommended_production_units,
-        "Recommended_Production_Value": round(recommended_production_units * unit_cost, 2),
-    })
-
-results_df = pd.DataFrame(results)
-
-st.subheader("Recommended Production by SKU")
-st.dataframe(results_df)
-
-# --- Simple summary by product family (if exists) ---
-if "Product_Family" in results_df.columns:
-    st.subheader("Summary by Product Family (Recommended Production Value)")
-    summary_family = (
-        results_df.groupby("Product_Family")["Recommended_Production_Value"]
-        .sum()
-        .reset_index()
-        .sort_values("Recommended_Production_Value", ascending=False)
-    )
-    st.bar_chart(
-        summary_family.set_index("Product_Family")["Recommended_Production_Value"]
-    )
-
-# --- Download Excel of results ---
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="OptiStock_Output")
-    processed_data = output.getvalue()
-    return processed_data
-
-excel_bytes = to_excel_bytes(results_df)
-
-st.download_button(
-    label="📥 Download Recommended Production (Excel)",
-    data=excel_bytes,
-    file_name="optistock_recommended_production.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+tab_home, tab_forecast, tab_expiry, tab_top10, tab_download = st.tabs(
+    ["🏠 Home", "📈 Forecast & Plan", "⏳ Expiry Risk", "⭐ Top 10 SKUs", "📥 Download"]
 )
 
-if not has_on_hand:
-    st.info(
-        "Note: Your dataset does not contain an 'On_Hand' column. "
-        "Recommended production is calculated assuming current on-hand = 0. "
-        "You can enhance this later by adding an On_Hand snapshot to the dataset."
+# ========== HOME TAB ==========
+with tab_home:
+    st.subheader("Welcome to OptiStock")
+    st.write(
+        """
+        **OptiStock** combines demand history, inventory snapshots, and expiry information
+        to help you make smarter production and inventory decisions.
+
+        **This run uses:**
+        - A light forecasting model (last 6 months avg × 12)
+        - Safety stock based on demand variability and lead time
+        - Expiry risk groupings by days-to-expiry
+        - SKU-level recommended production in units and dollars
+        """
     )
+
+    st.markdown("### Preview of Uploaded Data")
+    st.dataframe(raw_df.head(10))
+
+    st.markdown("### Preview of OptiStock Results")
+    st.dataframe(results_df.head(10))
+
+# ========== FORECAST & PLAN TAB ==========
+with tab_forecast:
+    st.subheader("Forecast & Production Plan")
+
+    st.write(
+        "This table shows forecasted 12-month demand, safety stock, on-hand inventory, "
+        "and recommended production by SKU."
+    )
+
+    st.dataframe(
+        results_df[
+            [
+                "SKU",
+                "Product_Family",
+                "Forecast_12M_Units",
+                "Forecast_12M_Value",
+                "Safety_Stock_Units",
+                "Safety_Stock_Value",
+                "On_Hand_Units",
+                "On_Hand_Value",
+                "Recommended_Production_Units",
+                "Recommended_Production_Value",
+                "Inventory_Risk_Label",
+            ]
+        ].sort_values("Recommended_Production_Value", ascending=False)
+    )
+
+    st.markdown("### Summary – Total Recommended Production Value")
+    total_rec_value = results_df["Recommended_Production_Value"].sum()
+    st.metric("Total Recommended Production (Value)", f"${total_rec_value:,.0f}")
+
+# ========== EXPIRY RISK TAB ==========
+with tab_expiry:
+    st.subheader("Expiry Risk Dashboard")
+
+    st.write(
+        "This view summarizes units and value at expiry risk across SKUs, focusing on inventory "
+        "expiring within the next 90 days."
+    )
+
+    # Aggregate expiry metrics
+    agg = results_df.copy()
+
+    total_on_hand_units = agg["Total_On_Hand_Units"].sum()
+    exp_0_30_units = agg["Expiring_0_30_Units"].sum()
+    exp_31_90_units = agg["Expiring_31_90_Units"].sum()
+    exp_soon_units = agg["Expiring_Soon_Units_<=90"].sum()
+    exp_soon_value = agg["Expiring_Soon_Value_<=90"].sum()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total On-hand Units", f"{total_on_hand_units:,.0f}")
+    col2.metric("Units Expiring ≤ 90 Days", f"{exp_soon_units:,.0f}")
+    col3.metric("Value Expiring ≤ 90 Days", f"${exp_soon_value:,.0f}")
+
+    st.markdown("### Expiry Buckets (Units)")
+    expiry_buckets = pd.DataFrame({
+        "Bucket": ["0–30 days", "31–90 days", ">90 days"],
+        "Units": [exp_0_30_units, exp_31_90_units, agg["Expiring_>90_Units"].sum()]
+    }).set_index("Bucket")
+    st.bar_chart(expiry_buckets)
+
+    st.markdown("### SKUs with Highest Expiry Risk (Units ≤ 90 days)")
+    top_expiry = (
+        results_df[results_df["Expiring_Soon_Units_<=90"] > 0]
+        .sort_values("Expiring_Soon_Units_<=90", ascending=False)
+        .head(20)
+    )
+    st.dataframe(
+        top_expiry[
+            [
+                "SKU",
+                "Product_Family",
+                "Total_On_Hand_Units",
+                "Expiring_Soon_Units_<=90",
+                "Expiring_Soon_Value_<=90",
+                "Inventory_Risk_Label",
+            ]
+        ]
+    )
+
+# ========== TOP 10 SKUs TAB ==========
+with tab_top10:
+    st.subheader("Top 10 SKUs by Recommended Production Value")
+
+    top10 = (
+        results_df.sort_values("Recommended_Production_Value", ascending=False)
+        .head(10)
+        .reset_index(drop=True)
+    )
+
+    st.dataframe(
+        top10[
+            [
+                "SKU",
+                "Product_Family",
+                "Recommended_Production_Units",
+                "Recommended_Production_Value",
+                "Total_On_Hand_Units",
+                "Expiring_Soon_Units_<=90",
+                "Expiring_Soon_Value_<=90",
+                "Inventory_Risk_Label",
+            ]
+        ]
+    )
+
+    chart_data = top10.set_index("SKU")["Recommended_Production_Value"]
+    st.markdown("### Recommended Production Value – Top 10 SKUs")
+    st.bar_chart(chart_data)
+
+# ========== DOWNLOAD TAB ==========
+with tab_download:
+    st.subheader("Download OptiStock Results")
+
+    st.write(
+        "Download the full SKU-level table including forecasts, safety stock, expiry metrics, "
+        "and recommended production values."
+    )
+
+    excel_bytes = to_excel_bytes(results_df)
+
+    st.download_button(
+        label="📥 Download Results as Excel",
+        data=excel_bytes,
+        file_name="optistock_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.write("You can share this file with stakeholders, or use it as input to PowerPoint reports.")
