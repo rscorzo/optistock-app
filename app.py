@@ -309,31 +309,42 @@ st.markdown(
         --risk-yellow: #E3A008;
         --risk-green: #3BA55C;
     }
+
+    /* Fix: Add more top padding so content doesn't overlap header */
     .block-container {
-        padding-top: 0rem !important;
+        padding-top: 2.5rem !important;
         padding-left: 2rem !important;
         padding-right: 2rem !important;
     }
+
+    /* Top thin blue bar */
     .top-bar {
         height: 6px;
         width: 100%;
         background: var(--primary-blue);
     }
+
+    /* Main navy header – reduced height so it no longer gets cut off */
     .main-header {
         background-color: var(--primary-navy);
         color: white;
-        padding: 0.6rem 2rem 0.9rem 2rem;
+        padding: 0.35rem 1.6rem 0.55rem 1.6rem; /* smaller top/bottom padding */
         box-shadow: 0 2px 4px rgba(0,0,0,0.15);
     }
+
     .main-header-title {
-        font-size: 1.3rem;
+        font-size: 1.2rem; /* slightly smaller to fit on screen */
         font-weight: 700;
         margin-bottom: 0.1rem;
     }
+
     .main-header-subtitle {
-        font-size: 0.9rem;
+        font-size: 0.82rem;
+        margin-top: -0.1rem; /* pulls closer to title */
         opacity: 0.9;
     }
+
+    /* Upload card styling */
     .upload-card {
         background-color: var(--card-bg);
         border-radius: 8px;
@@ -342,6 +353,8 @@ st.markdown(
         margin-top: 0.75rem;
         box-shadow: 0 1px 2px rgba(0,0,0,0.05);
     }
+
+    /* Section headers */
     .section-title {
         font-size: 1.1rem;
         font-weight: 600;
@@ -349,6 +362,8 @@ st.markdown(
         margin-bottom: 0.25rem;
         color: var(--primary-navy);
     }
+
+    /* KPI Layout */
     .kpi-row {
         display: flex;
         gap: 0.75rem;
@@ -356,6 +371,7 @@ st.markdown(
         margin-top: 0.5rem;
         margin-bottom: 0.5rem;
     }
+
     .kpi-card {
         background-color: var(--card-bg);
         border-radius: 8px;
@@ -365,6 +381,7 @@ st.markdown(
         min-width: 180px;
         flex: 1 1 0;
     }
+
     .kpi-title {
         font-size: 0.8rem;
         text-transform: uppercase;
@@ -372,16 +389,20 @@ st.markdown(
         color: #6B7280;
         margin-bottom: 0.15rem;
     }
+
     .kpi-value {
         font-size: 1.2rem;
         font-weight: 700;
         color: #111827;
     }
+
     .kpi-sub {
         font-size: 0.8rem;
         color: #6B7280;
         margin-top: 0.1rem;
     }
+
+    /* Buttons */
     .stDownloadButton button, .stButton button {
         border-radius: 999px;
         background-color: var(--primary-blue);
@@ -389,6 +410,7 @@ st.markdown(
         border: 1px solid var(--primary-blue);
         padding: 0.35rem 0.9rem;
     }
+
     .stDownloadButton button:hover, .stButton button:hover {
         background-color: #325f8e;
         border-color: #325f8e;
