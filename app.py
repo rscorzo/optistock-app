@@ -1,675 +1,897 @@
-import streamlit as st
-import pandas as pd
+import datetime as dt
 import numpy as np
-from io import BytesIO
+import pandas as pd
+import streamlit as st
+import altair as alt
 
-# PowerPoint imports
-from pptx import Presentation
-from pptx.util import Inches, Pt
-from pptx.dml.color import RGBColor
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+st.set_page_config(
+    page_title="OptiStock – AI Inventory Analytics",
+    page_icon="📦",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# --------------------------------------------------
+# GLOBAL STYLE
+# --------------------------------------------------
+CUSTOM_CSS = """
+<style>
+/* General */
+body, .stApp {
+    background-color: #0A1018;
+    color: #F5F7FA;
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background: #050913;
+}
+
+/* KPI cards */
+.kpi-card {
+    padding: 1rem 1.2rem;
+    border-radius: 1rem;
+    background: linear-gradient(135deg, #0F172A, #020617);
+    border: 1px solid rgba(148, 163, 184, 0.4);
+    box-shadow: 0 14px 28px rgba(15, 23, 42, 0.45);
+}
+
+/* Pill badges */
+.badge {
+    display: inline-block;
+    padding: 0.2rem 0.6rem;
+    font-size: 0.75rem;
+    border-radius: 999px;
+    background: rgba(59, 130, 246, 0.12);
+    color: #E5F2FF;
+    border: 1px solid rgba(59, 130, 246, 0.6);
+}
+
+/* Insights panel */
+.insight-card {
+    padding: 0.9rem 1rem;
+    margin-bottom: 0.5rem;
+    border-radius: 0.9rem;
+    background: rgba(15, 23, 42, 0.85);
+    border: 1px solid rgba(148, 163, 184, 0.4);
+}
+
+/* Table tweaks */
+table {
+    font-size: 0.9rem;
+}
+thead tr th {
+    background-color: #020617 !important;
+}
+
+/* Slider label fix */
+[data-baseweb="slider"] {
+    padding-top: 0.5rem;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# --------------------------------------------------
+# DEMO DATA
+# --------------------------------------------------
+def create_demo_inventory(n_skus: int = 60) -> pd.DataFrame:
+    np.random.seed(42)
+    today = dt.date.today()
+    products = [f"SKU-{1000+i}" for i in range(n_skus)]
+    product_names = [f"Pharma Product {i+1}" for i in range(n_skus)]
+    warehouses = np.random.choice(["WH-NJ1", "WH-PA2", "WH-NY3"], size=n_skus)
+
+    # Random horizons: some expired, some near expiry, some long-dated
+    expiry_days = np.random.randint(-120, 365, size=n_skus)
+    expiry_dates = [today + dt.timedelta(days=int(d)) for d in expiry_days]
+
+    # Last movement between 0 and 365 days ago
+    last_move_days = np.random.randint(0, 365, size=n_skus)
+    last_movement = [today - dt.timedelta(days=int(d)) for d in last_move_days]
+
+    on_hand_qty = np.random.randint(50, 5000, size=n_skus)
+    unit_cost = np.random.uniform(5, 250, size=n_skus)
+
+    df = pd.DataFrame(
+        {
+            "SKU": products,
+            "Product_Name": product_names,
+            "Warehouse": warehouses,
+            "Expiry_Date": expiry_dates,
+            "Last_Movement_Date": last_movement,
+            "On_Hand_Qty": on_hand_qty,
+            "Unit_Cost": np.round(unit_cost, 2),
+        }
+    )
+    return df
 
 
-# =========================================================
-# VALIDATION
-# =========================================================
-def validate_columns(df: pd.DataFrame):
-    required = [
-        "SKU",
-        "Date",
-        "Monthly_Demand",
-        "Lead_Time_Days",
-        "Shelf_Life_Days",
-        "Unit_Cost",
-        "On_Hand",
-        "Expiration_Date",
-        "Days_To_Expiry",
-        "Expiring_Soon_Flag",
-        "Inventory_Value",
-    ]
-    missing = [c for c in required if c not in df.columns]
-    return missing
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+def parse_date_series(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").dt.date
 
 
-# =========================================================
-# FORECAST + INVENTORY LOGIC (LIGHT MODEL)
-# =========================================================
-def compute_light_forecast(df: pd.DataFrame):
+def compute_inventory_value(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"])
+    df["Inventory_Value"] = df["On_Hand_Qty"] * df["Unit_Cost"]
+    return df
 
-    sku_list = df["SKU"].unique()
-    results = []
 
-    for sku in sku_list:
-        sku_hist = df[df["SKU"] == sku].sort_values("Date")
-        demand = sku_hist["Monthly_Demand"].astype(float)
+def add_expiry_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    today = dt.date.today()
 
-        # Forecast: last 6-month avg * 12
-        if len(demand) >= 6:
-            avg_6 = demand.tail(6).mean()
-        else:
-            avg_6 = demand.mean()
+    df["Days_To_Expiry"] = (pd.to_datetime(df["Expiry_Date"]).dt.date - today).dt.days
+    df["Expiry_Status"] = pd.cut(
+        df["Days_To_Expiry"],
+        bins=[-10_000, -1, 0, 30, 60, 90, 36500],
+        labels=[
+            "Expired",
+            "Expiring Today",
+            "0–30 Days",
+            "31–60 Days",
+            "61–90 Days",
+            "> 90 Days",
+        ],
+    )
 
-        forecast_12m_units = float(avg_6 * 12)
+    return df
 
-        # Safety stock
-        lead_time_days = float(sku_hist["Lead_Time_Days"].iloc[0])
-        lead_time_months = max(lead_time_days / 30.0, 0.5)
-        sigma = float(demand.std()) if demand.std() > 0 else 1.0
-        Z = 1.65  # ~95% service level
-        safety_stock_units = int(Z * sigma * np.sqrt(lead_time_months))
 
-        # On-hand (use last non-null)
-        sku_onhand = sku_hist[~sku_hist["On_Hand"].isna()]
-        on_hand_units = float(sku_onhand["On_Hand"].iloc[-1]) if not sku_onhand.empty else 0.0
+def add_movement_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    today = dt.date.today()
+    df["Days_Since_Move"] = (
+        today - pd.to_datetime(df["Last_Movement_Date"], errors="coerce").dt.date
+    ).dt.days
+    return df
 
-        # Cost
-        unit_cost = float(sku_hist["Unit_Cost"].mean())
 
-        # Expiry metrics (aggregate where On_Hand is present)
-        exp_rows = sku_onhand.copy()
-        if exp_rows.empty:
-            total_on_hand = 0.0
-            total_inv_value = 0.0
-            exp_0_30_units = exp_31_90_units = exp_gt_90_units = 0.0
-            exp_soon_units = exp_soon_value = 0.0
-            min_days_to_expiry = np.nan
-        else:
-            total_on_hand = float(exp_rows["On_Hand"].sum())
-            total_inv_value = float(exp_rows["Inventory_Value"].sum())
-            min_days_to_expiry = float(exp_rows["Days_To_Expiry"].min())
+def compute_kpi_metrics(df: pd.DataFrame) -> dict:
+    total_value = df["Inventory_Value"].sum()
 
-            exp_0_30_units = float(exp_rows.loc[exp_rows["Days_To_Expiry"] <= 30, "On_Hand"].sum())
-            exp_31_90_units = float(
-                exp_rows.loc[
-                    (exp_rows["Days_To_Expiry"] > 30) & (exp_rows["Days_To_Expiry"] <= 90),
-                    "On_Hand",
-                ].sum()
-            )
-            exp_gt_90_units = float(exp_rows.loc[exp_rows["Days_To_Expiry"] > 90, "On_Hand"].sum())
+    # At-risk buckets: 0-90 days + expired
+    mask_at_risk = df["Days_To_Expiry"] <= 90
+    at_risk_value = df.loc[mask_at_risk, "Inventory_Value"].sum()
 
-            exp_soon_units = exp_0_30_units + exp_31_90_units
-            exp_soon_value = float(
-                exp_rows.loc[exp_rows["Days_To_Expiry"] <= 90, "Inventory_Value"].sum()
-            )
+    mask_expired = df["Days_To_Expiry"] < 0
+    expired_value = df.loc[mask_expired, "Inventory_Value"].sum()
 
-        # Recommended production
-        recommended_prod_units = max(0, round(forecast_12m_units + safety_stock_units - on_hand_units))
-        recommended_prod_value = recommended_prod_units * unit_cost
+    # Slow-moving: > 90 days since last move
+    slow_mask = df["Days_Since_Move"] > 90
+    slow_value = df.loc[slow_mask, "Inventory_Value"].sum()
 
-        # Risk label
-        if total_on_hand == 0:
-            risk_label = "No Stock"
-        else:
-            ratio = exp_soon_units / total_on_hand if total_on_hand > 0 else 0
-            if ratio >= 0.5:
-                risk_label = "High Expiry Risk"
-            elif ratio >= 0.2:
-                risk_label = "Moderate Expiry Risk"
-            else:
-                risk_label = "Low Expiry Risk"
+    return {
+        "total_value": total_value,
+        "at_risk_value": at_risk_value,
+        "expired_value": expired_value,
+        "slow_value": slow_value,
+        "at_risk_pct": (at_risk_value / total_value * 100) if total_value else 0,
+        "expired_pct": (expired_value / total_value * 100) if total_value else 0,
+        "slow_pct": (slow_value / total_value * 100) if total_value else 0,
+    }
 
-        product_family = (
-            sku_hist["Product_Family"].iloc[0]
-            if "Product_Family" in sku_hist.columns
-            else ""
-        )
 
-        results.append(
+def generate_ai_like_insights(df: pd.DataFrame, max_insights: int = 8) -> list:
+    """Rule-based 'AI' insights – can later be replaced with real model output."""
+    insights = []
+    df_sorted = df.sort_values("Inventory_Value", ascending=False).reset_index(drop=True)
+
+    # 1. High-value at risk
+    high_risk = df_sorted[
+        (df_sorted["Days_To_Expiry"] <= 90) & (df_sorted["Days_To_Expiry"] >= 0)
+    ].head(3)
+    for _, row in high_risk.iterrows():
+        insights.append(
             {
-                "SKU": sku,
-                "Product_Family": product_family,
-                "Lead_Time_Days": lead_time_days,
-                "Shelf_Life_Days": float(sku_hist["Shelf_Life_Days"].iloc[0]),
-                "Unit_Cost": unit_cost,
-                # Forecast & stock
-                "Forecast_12M_Units": round(forecast_12m_units),
-                "Forecast_12M_Value": round(forecast_12m_units * unit_cost),
-                "Safety_Stock_Units": safety_stock_units,
-                "Safety_Stock_Value": round(safety_stock_units * unit_cost),
-                "On_Hand_Units": round(on_hand_units),
-                "On_Hand_Value": round(on_hand_units * unit_cost),
-                # Expiry metrics
-                "Total_On_Hand_Units": round(total_on_hand),
-                "Total_On_Hand_Value": round(total_inv_value),
-                "Expiring_0_30_Units": round(exp_0_30_units),
-                "Expiring_31_90_Units": round(exp_31_90_units),
-                "Expiring_>90_Units": round(exp_gt_90_units),
-                "Expiring_Soon_Units_<=90": round(exp_soon_units),
-                "Expiring_Soon_Value_<=90": round(exp_soon_value),
-                "Min_Days_To_Expiry": min_days_to_expiry,
-                # Recommendation
-                "Recommended_Production_Units": recommended_prod_units,
-                "Recommended_Production_Value": round(recommended_prod_value),
-                # Risk label
-                "Inventory_Risk_Label": risk_label,
+                "type": "Expiry Risk",
+                "severity": "High",
+                "sku": row["SKU"],
+                "text": f"{row['SKU']} ({row['Product_Name']}) is projected to expire in {int(row['Days_To_Expiry'])} days with ${row['Inventory_Value']:,.0f} at stake. Consider targeted discounts, sample programs, or reallocation.",
             }
         )
 
-    return pd.DataFrame(results)
-
-
-# =========================================================
-# EXCEL EXPORT
-# =========================================================
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="OptiStock_Output")
-    return output.getvalue()
-
-
-# =========================================================
-# POWERPOINT EXPORT
-# =========================================================
-def build_powerpoint(results_df, insights, total_forecast_units,
-                     total_recommended_value, total_at_risk_value, risk_pct):
-    prs = Presentation()
-
-    def add_header(slide, text):
-        width = prs.slide_width
-        rect = slide.shapes.add_shape(
-            autoshape_type_id=1,
-            left=0,
-            top=0,
-            width=width,
-            height=Inches(1.1),
+    # 2. Slow-moving with high value
+    slow_mask = df["Days_Since_Move"] > 120
+    slow_high = df_sorted[slow_mask].head(3)
+    for _, row in slow_high.iterrows():
+        insights.append(
+            {
+                "type": "Slow / Dead Stock",
+                "severity": "Medium",
+                "sku": row["SKU"],
+                "text": f"{row['SKU']} has not moved for {int(row['Days_Since_Move'])} days. Inventory value is ${row['Inventory_Value']:,.0f}. Review demand assumptions and reduce production or liquidate.",
+            }
         )
-        rect.fill.solid()
-        rect.fill.fore_color.rgb = RGBColor(31, 42, 68)  # navy
-        rect.line.color.rgb = RGBColor(31, 42, 68)
-        tf = rect.text_frame
-        tf.text = text
-        p = tf.paragraphs[0]
-        p.font.size = Pt(28)
-        p.font.bold = True
-        p.font.color.rgb = RGBColor(255, 255, 255)
 
-    # Slide 1 — Title
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    add_header(slide, "OptiStock – Executive Summary")
+    # 3. Warehouse-level concentration
+    wh = (
+        df.groupby("Warehouse")["Inventory_Value"]
+        .sum()
+        .sort_values(ascending=False)
+        .reset_index()
+    )
+    if len(wh) > 0:
+        top_wh = wh.iloc[0]
+        insights.append(
+            {
+                "type": "Working Capital",
+                "severity": "Info",
+                "sku": None,
+                "text": f"Warehouse {top_wh['Warehouse']} holds ${top_wh['Inventory_Value']:,.0f} in inventory, the highest across the network. Consider network optimization or redistribution.",
+            }
+        )
 
-    box = slide.shapes.add_textbox(Inches(0.8), Inches(1.6), Inches(8), Inches(2.5))
-    tf = box.text_frame
-    tf.text = "Inventory, Demand, and Expiry Analysis"
-    p = tf.paragraphs[0]
-    p.font.size = Pt(22)
-    p.font.bold = True
+    return insights[:max_insights]
 
-    # Slide 2 — KPIs
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    add_header(slide, "Key KPIs")
 
-    bullets = [
-        f"Total Forecasted Demand (12M): {total_forecast_units:,.0f} units",
-        f"Total Recommended Production Value: ${total_recommended_value:,.0f}",
-        f"Inventory Value at Risk (≤ 90 days): ${total_at_risk_value:,.0f}",
-        f"% Inventory Value at Risk: {risk_pct:,.1f}%",
-    ]
+# --------------------------------------------------
+# PAGE BUILDERS
+# --------------------------------------------------
+def page_dashboard(df: pd.DataFrame, metrics: dict, insights: list):
+    st.markdown("### 📊 Inventory Health Overview")
 
-    body = slide.shapes.add_textbox(Inches(0.8), Inches(1.7), Inches(8.5), Inches(4))
-    tf = body.text_frame
-    for i, b in enumerate(bullets):
-        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.text = b
-        p.font.size = Pt(18)
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div style="font-size:0.8rem; opacity:0.7;">Total Inventory Value</div>
+                <div style="font-size:1.4rem; font-weight:600; margin-top:0.2rem;">
+                    ${metrics['total_value']:,.0f}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div style="font-size:0.8rem; opacity:0.7;">At-Risk (≤ 90 days)</div>
+                <div style="font-size:1.4rem; font-weight:600; margin-top:0.2rem;">
+                    ${metrics['at_risk_value']:,.0f}
+                </div>
+                <div style="font-size:0.75rem; opacity:0.7;">{metrics['at_risk_pct']:.1f}% of total</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col3:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div style="font-size:0.8rem; opacity:0.7;">Expired Inventory</div>
+                <div style="font-size:1.4rem; font-weight:600; margin-top:0.2rem;">
+                    ${metrics['expired_value']:,.0f}
+                </div>
+                <div style="font-size:0.75rem; opacity:0.7;">{metrics['expired_pct']:.1f}% of total</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col4:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div style="font-size:0.8rem; opacity:0.7;">Slow / Dead Stock</div>
+                <div style="font-size:1.4rem; font-weight:600; margin-top:0.2rem;">
+                    ${metrics['slow_value']:,.0f}
+                </div>
+                <div style="font-size:0.75rem; opacity:0.7;">{metrics['slow_pct']:.1f}% of total</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    # Slide 3 — Expiry Overview
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    add_header(slide, "Expiry Risk Overview")
+    st.markdown("---")
 
-    total_onhand = results_df["Total_On_Hand_Units"].sum()
-    exp0 = results_df["Expiring_0_30_Units"].sum()
-    exp1 = results_df["Expiring_31_90_Units"].sum()
-    exp2 = results_df["Expiring_>90_Units"].sum()
+    left, right = st.columns([2, 1.2])
 
-    bullets = [
-        f"Total On-Hand Units: {total_onhand:,.0f}",
-        f"Units Expiring 0–30 Days: {exp0:,.0f}",
-        f"Units Expiring 31–90 Days: {exp1:,.0f}",
-        f"Units Expiring > 90 Days: {exp2:,.0f}",
-        f"Value at Risk (≤ 90 Days): ${total_at_risk_value:,.0f}",
-    ]
+    with left:
+        st.subheader("Expiry Risk Distribution")
+        expiry_summary = (
+            df.groupby("Expiry_Status")["Inventory_Value"]
+            .sum()
+            .reset_index()
+            .sort_values("Inventory_Value", ascending=False)
+        )
+        expiry_summary["Inventory_Value_M"] = expiry_summary["Inventory_Value"] / 1_000_000
 
-    body = slide.shapes.add_textbox(Inches(0.8), Inches(1.7), Inches(8.5), Inches(3.5))
-    tf = body.text_frame
-    for i, b in enumerate(bullets):
-        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.text = b
-        p.font.size = Pt(16)
+        chart = (
+            alt.Chart(expiry_summary)
+            .mark_bar()
+            .encode(
+                x=alt.X("Expiry_Status:N", title="Expiry Bucket"),
+                y=alt.Y("Inventory_Value_M:Q", title="Inventory Value (USD, millions)"),
+                tooltip=["Expiry_Status", alt.Tooltip("Inventory_Value", format="$.2f")],
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(chart, use_container_width=True)
 
-    # Slide 4 — Top 10 SKUs
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    add_header(slide, "Top 10 SKUs – Recommended Production")
+        st.subheader("Inventory Value by Warehouse")
+        wh_summary = (
+            df.groupby("Warehouse")["Inventory_Value"].sum().reset_index().sort_values("Inventory_Value", ascending=False)
+        )
+        wh_summary["Inventory_Value_M"] = wh_summary["Inventory_Value"] / 1_000_000
+        if not wh_summary.empty:
+            chart_wh = (
+                alt.Chart(wh_summary)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Warehouse:N"),
+                    y=alt.Y("Inventory_Value_M:Q", title="Inventory Value (USD, millions)"),
+                    tooltip=["Warehouse", alt.Tooltip("Inventory_Value", format="$.2f")],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart_wh, use_container_width=True)
+        else:
+            st.info("No warehouse data available.")
 
-    top10 = results_df.sort_values("Recommended_Production_Value", ascending=False).head(10)
+    with right:
+        st.subheader("AI Insights")
+        st.caption("Rule-based insights – can be replaced with real ML model outputs later.")
 
-    rows = len(top10) + 1
-    table = slide.shapes.add_table(
-        rows=rows,
-        cols=4,
-        left=Inches(0.5),
-        top=Inches(1.5),
-        width=Inches(9),
-        height=Inches(3),
-    ).table
+        if not insights:
+            st.info("No major risks detected in the current dataset.")
+        else:
+            for ins in insights:
+                badge = ins["type"]
+                st.markdown(
+                    f"""
+                    <div class="insight-card">
+                        <span class="badge">{badge}</span>
+                        <div style="font-size:0.85rem; margin-top:0.4rem;">
+                            {ins['text']}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-    headers = ["SKU", "Units", "Value ($)", "Risk"]
-    for j, h in enumerate(headers):
-        cell = table.cell(0, j)
-        cell.text = h
-        cell.text_frame.paragraphs[0].font.bold = True
 
-    for i, (_, row) in enumerate(top10.iterrows(), start=1):
-        table.cell(i, 0).text = str(row["SKU"])
-        table.cell(i, 1).text = f"{row['Recommended_Production_Units']:,.0f}"
-        table.cell(i, 2).text = f"{row['Recommended_Production_Value']:,.0f}"
-        table.cell(i, 3).text = row["Inventory_Risk_Label"]
+def page_expiry_risk(df: pd.DataFrame):
+    st.markdown("### ⏱️ Expiry Risk & Obsolescence")
 
-    # Slide 5 — Key Insights
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    add_header(slide, "Key Insights")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.write("Inventory value by **expiry status**.")
+        expiry_summary = (
+            df.groupby("Expiry_Status")["Inventory_Value"]
+            .sum()
+            .reset_index()
+            .sort_values("Inventory_Value", ascending=False)
+        )
+        expiry_summary["Inventory_Value_M"] = expiry_summary["Inventory_Value"] / 1_000_000
 
-    body = slide.shapes.add_textbox(Inches(0.8), Inches(1.7), Inches(8.5), Inches(5))
-    tf = body.text_frame
-    tf.word_wrap = True
+        chart = (
+            alt.Chart(expiry_summary)
+            .mark_bar()
+            .encode(
+                x=alt.X("Expiry_Status:N", title="Expiry Bucket"),
+                y=alt.Y("Inventory_Value_M:Q", title="Inventory Value (USD, millions)"),
+                tooltip=["Expiry_Status", alt.Tooltip("Inventory_Value", format="$.2f")],
+            )
+            .properties(height=340)
+        )
+        st.altair_chart(chart, use_container_width=True)
 
-    if insights:
-        for i, line in enumerate(insights):
-            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-            p.text = f"- {line}"
-            p.font.size = Pt(18)
+    with col2:
+        st.write("Top SKUs at expiry risk (≤ 90 days).")
+        at_risk = df[df["Days_To_Expiry"] <= 90].copy()
+        at_risk = at_risk.sort_values("Inventory_Value", ascending=False).head(15)
+        if at_risk.empty:
+            st.success("No SKUs at expiry risk within the next 90 days.")
+        else:
+            st.dataframe(
+                at_risk[
+                    [
+                        "SKU",
+                        "Product_Name",
+                        "Warehouse",
+                        "Expiry_Date",
+                        "Days_To_Expiry",
+                        "On_Hand_Qty",
+                        "Inventory_Value",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+    st.markdown("---")
+    st.subheader("Expired Inventory")
+    expired = df[df["Days_To_Expiry"] < 0].copy()
+    if expired.empty:
+        st.success("No expired inventory in the dataset – great job!")
     else:
-        p = tf.paragraphs[0]
-        p.text = "No major risks detected."
-        p.font.size = Pt(18)
-
-    pptx_bytes = BytesIO()
-    prs.save(pptx_bytes)
-    pptx_bytes.seek(0)
-    return pptx_bytes.getvalue()
-
-
-# =========================================================
-# STREAMLIT APP LAYOUT
-# =========================================================
-st.set_page_config(page_title="OptiStock – Inventory Optimization", layout="wide")
-
-# ---------- Global CSS for enterprise look ----------
-st.markdown(
-    """
-    <style>
-    :root {
-        --primary-navy: #1F2A44;
-        --primary-blue: #3E78B2;
-        --light-gray: #F4F6FA;
-        --card-bg: #FFFFFF;
-        --border-gray: #C4CCD9;
-        --risk-red: #D64545;
-        --risk-yellow: #E3A008;
-        --risk-green: #3BA55C;
-    }
-
-    /* Fix: Add more top padding so content doesn't overlap header */
-    .block-container {
-        padding-top: 2.5rem !important;
-        padding-left: 2rem !important;
-        padding-right: 2rem !important;
-    }
-
-    /* Top thin blue bar */
-    .top-bar {
-        height: 6px;
-        width: 100%;
-        background: var(--primary-blue);
-    }
-
-    /* Main navy header – reduced height so it no longer gets cut off */
-    .main-header {
-        background-color: var(--primary-navy);
-        color: white;
-        padding: 0.35rem 1.6rem 0.55rem 1.6rem; /* smaller top/bottom padding */
-        box-shadow: 0 2px 4px rgba(0,0,0,0.15);
-    }
-
-    .main-header-title {
-        font-size: 1.2rem; /* slightly smaller to fit on screen */
-        font-weight: 700;
-        margin-bottom: 0.1rem;
-    }
-
-    .main-header-subtitle {
-        font-size: 0.82rem;
-        margin-top: -0.1rem; /* pulls closer to title */
-        opacity: 0.9;
-    }
-
-    /* Upload card styling */
-    .upload-card {
-        background-color: var(--card-bg);
-        border-radius: 8px;
-        border: 1px solid var(--border-gray);
-        padding: 0.75rem 1rem;
-        margin-top: 0.75rem;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-    }
-
-    /* Section headers */
-    .section-title {
-        font-size: 1.1rem;
-        font-weight: 600;
-        margin-top: 0.5rem;
-        margin-bottom: 0.25rem;
-        color: var(--primary-navy);
-    }
-
-    /* KPI Layout */
-    .kpi-row {
-        display: flex;
-        gap: 0.75rem;
-        flex-wrap: wrap;
-        margin-top: 0.5rem;
-        margin-bottom: 0.5rem;
-    }
-
-    .kpi-card {
-        background-color: var(--card-bg);
-        border-radius: 8px;
-        border: 1px solid var(--border-gray);
-        padding: 0.6rem 0.9rem;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-        min-width: 180px;
-        flex: 1 1 0;
-    }
-
-    .kpi-title {
-        font-size: 0.8rem;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: #6B7280;
-        margin-bottom: 0.15rem;
-    }
-
-    .kpi-value {
-        font-size: 1.2rem;
-        font-weight: 700;
-        color: #111827;
-    }
-
-    .kpi-sub {
-        font-size: 0.8rem;
-        color: #6B7280;
-        margin-top: 0.1rem;
-    }
-
-    /* Buttons */
-    .stDownloadButton button, .stButton button {
-        border-radius: 999px;
-        background-color: var(--primary-blue);
-        color: white;
-        border: 1px solid var(--primary-blue);
-        padding: 0.35rem 0.9rem;
-    }
-
-    .stDownloadButton button:hover, .stButton button:hover {
-        background-color: #325f8e;
-        border-color: #325f8e;
-        color: white;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------- Enterprise header ----------
-st.markdown('<div class="top-bar"></div>', unsafe_allow_html=True)
-st.markdown(
-    """
-    <div class="main-header">
-        <div class="main-header-title">OptiStock™</div>
-        <div class="main-header-subtitle">
-            AI Inventory & Expiry Intelligence – Forecast, Safety Stock, and Risk in One View
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------- Upload section ----------
-st.markdown('<div class="upload-card">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">Upload Combined Dataset</div>', unsafe_allow_html=True)
-uploaded_file = st.file_uploader(
-    "Upload your combined inventory & demand file (e.g., pharma_inventory_master_optistock.xlsx)",
-    type=["xlsx"],
-)
-st.markdown("</div>", unsafe_allow_html=True)
-
-if not uploaded_file:
-    st.stop()
-
-df = pd.read_excel(uploaded_file)
-
-missing = validate_columns(df)
-if missing:
-    st.error(f"❌ Missing required columns: {missing}")
-    st.stop()
-
-df["Date"] = pd.to_datetime(df["Date"])
-df["Expiration_Date"] = pd.to_datetime(df["Expiration_Date"])
-
-results_df = compute_light_forecast(df)
-
-# ---------------- EXEC SUMMARY METRICS & INSIGHTS ----------------
-total_forecast_units = results_df["Forecast_12M_Units"].sum()
-total_recommended_value = results_df["Recommended_Production_Value"].sum()
-total_at_risk_value = results_df["Expiring_Soon_Value_<=90"].sum()
-total_onhand_value = results_df["Total_On_Hand_Value"].sum()
-risk_pct = (total_at_risk_value / total_onhand_value * 100) if total_onhand_value > 0 else 0.0
-
-top_expiry = (
-    results_df[results_df["Expiring_Soon_Value_<=90"] > 0]
-    .sort_values("Expiring_Soon_Value_<=90", ascending=False)
-    .head(5)
-)
-top_prod = results_df.sort_values("Recommended_Production_Value", ascending=False).head(5)
-
-insights = []
-if not top_expiry.empty:
-    skus = ", ".join(top_expiry["SKU"].astype(str).tolist())
-    share = (
-        top_expiry["Expiring_Soon_Value_<=90"].sum() / total_at_risk_value * 100
-        if total_at_risk_value > 0
-        else 0
-    )
-    insights.append(
-        f"Expiry risk (≤ 90 days) is concentrated in SKUs {skus}, which account for ~{share:,.0f}% of value at risk."
-    )
-if not top_prod.empty:
-    skus = ", ".join(top_prod["SKU"].astype(str).tolist())
-    insights.append(
-        f"Recommended production value is primarily driven by SKUs {skus}, indicating key manufacturing focus areas."
-    )
-if total_onhand_value > 0:
-    insights.append(
-        f"Approximately {risk_pct:,.1f}% of total on-hand inventory value is at risk of expiry within 90 days."
-    )
-insights.append(
-    f"Total 12-month forecasted demand across all SKUs is {total_forecast_units:,.0f} units."
-)
-
-# =========================================================
-# TABS
-# =========================================================
-tab_summary, tab_forecast, tab_expiry, tab_top10, tab_download = st.tabs(
-    ["📊 Executive Summary", "📈 Forecast & Plan", "⏳ Expiry Risk", "⭐ Top 10 SKUs", "📥 Download"]
-)
-
-# ---------------- EXEC SUMMARY TAB ----------------
-with tab_summary:
-    st.markdown('<div class="section-title">Executive Overview</div>', unsafe_allow_html=True)
-
-    # KPI row
-    kpi_html = f"""
-    <div class="kpi-row">
-      <div class="kpi-card">
-        <div class="kpi-title">Forecasted Demand (12M)</div>
-        <div class="kpi-value">{total_forecast_units:,.0f} units</div>
-        <div class="kpi-sub">All SKUs combined</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-title">Recommended Production Value</div>
-        <div class="kpi-value">${total_recommended_value:,.0f}</div>
-        <div class="kpi-sub">Next 12 months</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-title">Value at Expiry Risk (≤ 90 days)</div>
-        <div class="kpi-value">${total_at_risk_value:,.0f}</div>
-        <div class="kpi-sub">Inventory at risk of write-off</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-title">% Inventory Value at Risk</div>
-        <div class="kpi-value">{risk_pct:,.1f}%</div>
-        <div class="kpi-sub">Of total on-hand value</div>
-      </div>
-    </div>
-    """
-    st.markdown(kpi_html, unsafe_allow_html=True)
-
-    st.markdown('<div class="section-title">Key Insights</div>', unsafe_allow_html=True)
-    for i in insights:
-        st.write(f"- {i}")
-
-    st.markdown('<div class="section-title">Top Expiry Risk SKUs (by value ≤ 90 days)</div>', unsafe_allow_html=True)
-    if not top_expiry.empty:
+        st.warning(
+            f"There are {len(expired)} SKUs with expired inventory totalling ${expired['Inventory_Value'].sum():,.0f}."
+        )
         st.dataframe(
-            top_expiry[
+            expired[
                 [
                     "SKU",
-                    "Product_Family",
-                    "Total_On_Hand_Units",
-                    "Expiring_Soon_Units_<=90",
-                    "Expiring_Soon_Value_<=90",
-                    "Inventory_Risk_Label",
+                    "Product_Name",
+                    "Warehouse",
+                    "Expiry_Date",
+                    "Days_To_Expiry",
+                    "On_Hand_Qty",
+                    "Inventory_Value",
                 ]
-            ]
+            ],
+            use_container_width=True,
         )
-    else:
-        st.write("No SKUs with expiry risk ≤ 90 days in this dataset.")
 
-# ---------------- FORECAST TAB ----------------
-with tab_forecast:
-    st.markdown('<div class="section-title">Forecast & Production Plan</div>', unsafe_allow_html=True)
-    st.write(
-        "Forecasted 12-month demand, safety stock, current on-hand inventory, "
-        "and recommended production by SKU."
+
+def page_slow_stock(df: pd.DataFrame):
+    st.markdown("### 🐌 Slow & Dead Stock")
+
+    threshold_days = st.slider(
+        "Define slow-moving threshold (days since last movement):",
+        min_value=30,
+        max_value=360,
+        value=90,
+        step=15,
     )
 
-    display_cols = [
-        "SKU",
-        "Product_Family",
-        "Forecast_12M_Units",
-        "Forecast_12M_Value",
-        "Safety_Stock_Units",
-        "Safety_Stock_Value",
-        "On_Hand_Units",
-        "On_Hand_Value",
-        "Recommended_Production_Units",
-        "Recommended_Production_Value",
-        "Inventory_Risk_Label",
-    ]
-    st.dataframe(
-        results_df[display_cols].sort_values("Recommended_Production_Value", ascending=False)
+    slow = df[df["Days_Since_Move"] > threshold_days].copy()
+    st.caption(
+        f"Showing SKUs with **no movement in more than {threshold_days} days**."
     )
 
-# ---------------- EXPIRY TAB ----------------
-with tab_expiry:
-    st.markdown('<div class="section-title">Expiry Risk Dashboard</div>', unsafe_allow_html=True)
+    if slow.empty:
+        st.success("No SKUs meet the slow-moving criteria for the selected threshold.")
+        return
 
-    total_on_hand_units = results_df["Total_On_Hand_Units"].sum()
-    exp_0_30_units = results_df["Expiring_0_30_Units"].sum()
-    exp_31_90_units = results_df["Expiring_31_90_Units"].sum()
-    exp_gt_90_units = results_df["Expiring_>90_Units"].sum()
+    col1, col2 = st.columns([2, 1])
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total On-hand Units", f"{total_on_hand_units:,.0f}")
-    c2.metric("Units Expiring ≤ 90 Days", f"{(exp_0_30_units + exp_31_90_units):,.0f}")
-    c3.metric("Value Expiring ≤ 90 Days", f"${total_at_risk_value:,.0f}")
+    with col1:
+        st.dataframe(
+            slow[
+                [
+                    "SKU",
+                    "Product_Name",
+                    "Warehouse",
+                    "Last_Movement_Date",
+                    "Days_Since_Move",
+                    "On_Hand_Qty",
+                    "Inventory_Value",
+                ]
+            ].sort_values("Days_Since_Move", ascending=False),
+            use_container_width=True,
+        )
 
-    st.markdown("#### Expiry Buckets (Units)")
-    expiry_buckets = (
-        pd.DataFrame(
+    with col2:
+        by_wh = (
+            slow.groupby("Warehouse")["Inventory_Value"]
+            .sum()
+            .reset_index()
+            .sort_values("Inventory_Value", ascending=False)
+        )
+        by_wh["Inventory_Value_M"] = by_wh["Inventory_Value"] / 1_000_000
+        st.write("Slow / dead stock by warehouse")
+        chart = (
+            alt.Chart(by_wh)
+            .mark_bar()
+            .encode(
+                x="Warehouse:N",
+                y=alt.Y("Inventory_Value_M:Q", title="Value (USD, millions)"),
+                tooltip=["Warehouse", alt.Tooltip("Inventory_Value", format="$.2f")],
+            )
+            .properties(height=260)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+
+def page_sku_drilldown(df: pd.DataFrame):
+    st.markdown("### 🔍 SKU-Level Drilldown")
+
+    skus = df["SKU"].unique().tolist()
+    if not skus:
+        st.info("No SKUs found in the dataset.")
+        return
+
+    sku_selected = st.selectbox("Select SKU:", sorted(skus))
+    sku_df = df[df["SKU"] == sku_selected].copy()
+    row = sku_df.iloc[0]
+
+    col_info, col_chart = st.columns([1.1, 1.9])
+    with col_info:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div style="font-size:0.9rem; opacity:0.8;">{row['SKU']}</div>
+                <div style="font-size:1.1rem; font-weight:600; margin-top:0.2rem;">
+                    {row['Product_Name']}
+                </div>
+                <div style="font-size:0.8rem; margin-top:0.6rem;">
+                    Warehouse: <b>{row['Warehouse']}</b><br/>
+                    On Hand: <b>{int(row['On_Hand_Qty'])}</b><br/>
+                    Inventory Value: <b>${row['Inventory_Value']:,.0f}</b><br/>
+                    Expiry Date: <b>{row['Expiry_Date']}</b> ({int(row['Days_To_Expiry'])} days)<br/>
+                    Last Movement: <b>{row['Last_Movement_Date']}</b> ({int(row['Days_Since_Move'])} days ago)
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col_chart:
+        # Simulated history just for visualization (since we don't have real time-series)
+        st.caption("Simulated demand & stock history (illustrative for demo purposes).")
+        num_points = 12
+        months = pd.date_range(
+            end=dt.date.today(), periods=num_points, freq="MS"
+        ).date
+        demand = np.maximum(
+            0,
+            np.random.normal(loc=row["On_Hand_Qty"] / 8, scale=row["On_Hand_Qty"] / 20, size=num_points),
+        ).astype(int)
+        stock = np.maximum(
+            0,
+            row["On_Hand_Qty"]
+            - np.cumsum(np.random.normal(loc=demand.mean(), scale=demand.std(), size=num_points)),
+        )
+
+        history = pd.DataFrame(
             {
-                "Bucket": ["0–30 days", "31–90 days", ">90 days"],
-                "Units": [exp_0_30_units, exp_31_90_units, exp_gt_90_units],
+                "Month": months,
+                "Demand": demand,
+                "Stock_Level": stock,
             }
         )
-        .set_index("Bucket")
-    )
-    st.bar_chart(expiry_buckets)
+        hist_melt = history.melt("Month", var_name="Metric", value_name="Value")
 
-    st.markdown("#### SKUs with Highest Expiry Risk (Units ≤ 90 days)")
-    top_expiry_units = (
-        results_df[results_df["Expiring_Soon_Units_<=90"] > 0]
-        .sort_values("Expiring_Soon_Units_<=90", ascending=False)
-        .head(20)
+        chart = (
+            alt.Chart(hist_melt)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("Month:T", title="Month"),
+                y=alt.Y("Value:Q", title="Units"),
+                color="Metric:N",
+                tooltip=["Month", "Metric", "Value"],
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+
+def page_data_health(df: pd.DataFrame):
+    st.markdown("### 🧪 Data Health Check")
+
+    issues = []
+
+    # Missing expiry
+    missing_expiry = df["Expiry_Date"].isna().sum()
+    if missing_expiry > 0:
+        issues.append(f"{missing_expiry} rows have missing expiry dates.")
+
+    # Negative or zero qty
+    neg_qty = (df["On_Hand_Qty"] < 0).sum()
+    zero_qty = (df["On_Hand_Qty"] == 0).sum()
+    if neg_qty:
+        issues.append(f"{neg_qty} rows with negative on-hand quantity.")
+    if zero_qty:
+        issues.append(f"{zero_qty} rows with zero on-hand quantity.")
+
+    # Duplicates by SKU + Warehouse + Expiry
+    duplicates = (
+        df.duplicated(subset=["SKU", "Warehouse", "Expiry_Date"], keep=False).sum()
     )
-    st.dataframe(
-        top_expiry_units[
-            [
-                "SKU",
-                "Product_Family",
-                "Total_On_Hand_Units",
-                "Expiring_Soon_Units_<=90",
-                "Expiring_Soon_Value_<=90",
-                "Inventory_Risk_Label",
-            ]
+    if duplicates:
+        issues.append(
+            f"{duplicates} potential duplicate rows detected (same SKU, warehouse, expiry)."
+        )
+
+    if not issues:
+        st.success("No major data quality issues detected in the current dataset.")
+    else:
+        for issue in issues:
+            st.warning(issue)
+
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Missing or Invalid Dates")
+        invalid_dates = df[df["Expiry_Date"].isna() | df["Last_Movement_Date"].isna()]
+        if invalid_dates.empty:
+            st.info("All expiry and movement dates are present and valid.")
+        else:
+            st.dataframe(
+                invalid_dates[
+                    [
+                        "SKU",
+                        "Product_Name",
+                        "Warehouse",
+                        "Expiry_Date",
+                        "Last_Movement_Date",
+                        "On_Hand_Qty",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+    with col2:
+        st.subheader("Duplicate Records (by SKU, Warehouse, Expiry)")
+        dup_df = df[
+            df.duplicated(subset=["SKU", "Warehouse", "Expiry_Date"], keep=False)
+        ].copy()
+        if dup_df.empty:
+            st.info("No potential duplicate inventory records found.")
+        else:
+            st.dataframe(
+                dup_df[
+                    [
+                        "SKU",
+                        "Product_Name",
+                        "Warehouse",
+                        "Expiry_Date",
+                        "On_Hand_Qty",
+                        "Inventory_Value",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+
+def page_insights(df: pd.DataFrame, insights: list):
+    st.markdown("### 🤖 AI-Driven Recommendations (Rule-Based Prototype)")
+    st.caption(
+        "This page uses rule-based logic to simulate how OptiStock will surface AI-driven recommendations. "
+        "Later you can plug in a real ML model and reuse the same UI."
+    )
+
+    if not insights:
+        st.success("No significant risk signals detected in the current dataset.")
+        return
+
+    for ins in insights:
+        col1, col2 = st.columns([0.15, 0.85])
+        with col1:
+            st.markdown(
+                f"<span class='badge'>{ins['type']}</span>", unsafe_allow_html=True
+            )
+        with col2:
+            st.write(ins["text"])
+
+    st.markdown("---")
+    st.subheader("Export Recommendations")
+    export_df = pd.DataFrame(
+        [
+            {
+                "Type": ins["type"],
+                "Severity": ins["severity"],
+                "SKU": ins["sku"],
+                "Recommendation": ins["text"],
+            }
+            for ins in insights
         ]
     )
-
-# ---------------- TOP 10 TAB ----------------
-with tab_top10:
-    st.markdown('<div class="section-title">Top 10 SKUs by Recommended Production Value</div>', unsafe_allow_html=True)
-    top10 = results_df.sort_values("Recommended_Production_Value", ascending=False).head(10)
-    st.dataframe(
-        top10[
-            [
-                "SKU",
-                "Product_Family",
-                "Recommended_Production_Units",
-                "Recommended_Production_Value",
-                "Total_On_Hand_Units",
-                "Expiring_Soon_Units_<=90",
-                "Expiring_Soon_Value_<=90",
-                "Inventory_Risk_Label",
-            ]
-        ]
-    )
-
-# ---------------- DOWNLOAD TAB ----------------
-with tab_download:
-    st.markdown('<div class="section-title">Download Reports</div>', unsafe_allow_html=True)
-
-    st.subheader("Excel Export")
-    excel_bytes = to_excel_bytes(results_df)
+    csv = export_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "📥 Download Excel",
-        data=excel_bytes,
-        file_name="optistock_results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "⬇️ Download Recommendations (CSV)",
+        csv,
+        file_name="optistock_recommendations.csv",
+        mime="text/csv",
     )
 
-    st.subheader("Executive PowerPoint Export")
-    ppt_bytes = build_powerpoint(
-        results_df,
-        insights,
-        total_forecast_units,
-        total_recommended_value,
-        total_at_risk_value,
-        risk_pct,
+
+def page_simulator(df: pd.DataFrame):
+    st.markdown("### 🧮 What-If Simulator (Demand, Lead Time & Safety Stock)")
+    st.caption(
+        "Use this simple simulator to estimate how demand and lead-time changes could affect "
+        "recommended stock levels for a given SKU."
     )
-    st.download_button(
-        "📊 Download Executive PowerPoint",
-        data=ppt_bytes,
-        file_name="optistock_executive_summary.pptx",
-        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    )
+
+    if df.empty:
+        st.info("Load data first to simulate scenarios.")
+        return
+
+    sku = st.selectbox("Select SKU for simulation:", sorted(df["SKU"].unique()))
+    row = df[df["SKU"] == sku].iloc[0]
+
+    col_inputs, col_outputs = st.columns([1.1, 1.4])
+
+    with col_inputs:
+        st.markdown("#### Assumptions")
+
+        base_daily_demand = st.number_input(
+            "Baseline average daily demand (units)",
+            min_value=1.0,
+            value=max(5.0, float(row["On_Hand_Qty"] // 45) or 5.0),
+            step=1.0,
+        )
+        base_lead_time = st.number_input(
+            "Baseline supplier lead time (days)",
+            min_value=1.0,
+            value=30.0,
+            step=1.0,
+        )
+        service_level = st.slider(
+            "Target service level (safety factor multiplier)",
+            min_value=0.5,
+            max_value=2.5,
+            value=1.5,
+            step=0.1,
+        )
+
+        st.markdown("#### Scenario Adjustments")
+        demand_change = st.slider(
+            "Demand change (%)",
+            min_value=-50,
+            max_value=100,
+            value=10,
+            step=5,
+        )
+        lead_time_change = st.slider(
+            "Lead time change (%)",
+            min_value=-50,
+            max_value=100,
+            value=0,
+            step=5,
+        )
+
+    with col_outputs:
+        new_daily_demand = base_daily_demand * (1 + demand_change / 100)
+        new_lead_time = base_lead_time * (1 + lead_time_change / 100)
+        safety_stock = service_level * np.sqrt(new_lead_time) * new_daily_demand * 0.5
+        reorder_point = new_daily_demand * new_lead_time + safety_stock
+
+        st.markdown("#### Results")
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div style="font-size:0.9rem; opacity:0.7;">Simulated for {sku} – {row['Product_Name']}</div>
+                <div style="font-size:0.85rem; margin-top:0.7rem;">
+                    New avg daily demand: <b>{new_daily_demand:.1f} units/day</b><br/>
+                    New lead time: <b>{new_lead_time:.1f} days</b><br/>
+                    Recommended safety stock: <b>{safety_stock:,.0f} units</b><br/>
+                    Recommended reorder point: <b>{reorder_point:,.0f} units</b><br/>
+                    Current on-hand: <b>{int(row['On_Hand_Qty'])} units</b>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if row["On_Hand_Qty"] > reorder_point:
+            st.info(
+                "Current on-hand inventory is **above** the simulated reorder point – potential excess capacity."
+            )
+        else:
+            st.warning(
+                "Current on-hand inventory is **below** the simulated reorder point – risk of stockout under this scenario."
+            )
+
+
+# --------------------------------------------------
+# DATA LOADING
+# --------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_inventory_data(uploaded_file) -> pd.DataFrame:
+    if uploaded_file is None:
+        return create_demo_inventory()
+
+    suffix = uploaded_file.name.lower().split(".")[-1]
+    if suffix in ["xlsx", "xls"]:
+        df = pd.read_excel(uploaded_file)
+    else:
+        df = pd.read_csv(uploaded_file)
+
+    # Expect/rename columns if needed (edit these mappings to match your file)
+    col_map = {
+        "sku": "SKU",
+        "product_name": "Product_Name",
+        "product": "Product_Name",
+        "warehouse": "Warehouse",
+        "wh": "Warehouse",
+        "expiry_date": "Expiry_Date",
+        "expiration_date": "Expiry_Date",
+        "exp_date": "Expiry_Date",
+        "on_hand_qty": "On_Hand_Qty",
+        "qty_on_hand": "On_Hand_Qty",
+        "quantity": "On_Hand_Qty",
+        "unit_cost": "Unit_Cost",
+        "last_movement_date": "Last_Movement_Date",
+        "last_sale_date": "Last_Movement_Date",
+        "last_move_date": "Last_Movement_Date",
+    }
+
+    df_cols_lower = {c.lower(): c for c in df.columns}
+    for logical, target in col_map.items():
+        if logical in df_cols_lower:
+            df.rename(columns={df_cols_lower[logical]: target}, inplace=True)
+
+    required = ["SKU", "Product_Name", "Warehouse", "Expiry_Date", "On_Hand_Qty", "Unit_Cost", "Last_Movement_Date"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing required columns: {missing}. Please adjust your file or the column mappings in app.py."
+        )
+
+    df["Expiry_Date"] = parse_date_series(df["Expiry_Date"])
+    df["Last_Movement_Date"] = parse_date_series(df["Last_Movement_Date"])
+
+    df["On_Hand_Qty"] = pd.to_numeric(df["On_Hand_Qty"], errors="coerce").fillna(0)
+    df["Unit_Cost"] = pd.to_numeric(df["Unit_Cost"], errors="coerce").fillna(0.0)
+
+    return df
+
+
+# --------------------------------------------------
+# MAIN APP
+# --------------------------------------------------
+def main():
+    with st.sidebar:
+        st.markdown("## 📦 OptiStock")
+        st.markdown(
+            "<span style='font-size:0.8rem; opacity:0.7;'>AI-Powered Inventory Analytics for Pharma</span>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("---")
+
+        uploaded_file = st.file_uploader(
+            "Upload inventory file", type=["csv", "xlsx", "xls"]
+        )
+        st.caption(
+            "Expected fields: SKU, Product_Name, Warehouse, Expiry_Date, Last_Movement_Date, On_Hand_Qty, Unit_Cost.\n"
+            "If no file is uploaded, demo data will be used."
+        )
+
+        st.markdown("---")
+        page = st.radio(
+            "Navigation",
+            (
+                "Dashboard",
+                "Expiry Risk",
+                "Slow & Dead Stock",
+                "SKU Drilldown",
+                "Data Health",
+                "AI Insights",
+                "What-If Simulator",
+            ),
+        )
+
+        st.markdown("---")
+        st.markdown(
+            "<small>Prototype UI – not for production use. Built for OptiStock concept demos.</small>",
+            unsafe_allow_html=True,
+        )
+
+    try:
+        df = load_inventory_data(uploaded_file)
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
+        st.stop()
+
+    df = compute_inventory_value(df)
+    df = add_expiry_features(df)
+    df = add_movement_features(df)
+    metrics = compute_kpi_metrics(df)
+    insights = generate_ai_like_insights(df)
+
+    st.title("OptiStock – AI-Powered Inventory Analytics")
+
+    if uploaded_file is None:
+        st.info(
+            "Running in **demo mode** using synthetic pharma inventory data. "
+            "Upload a real file in the sidebar to analyze your own inventory."
+        )
+
+    if page == "Dashboard":
+        page_dashboard(df, metrics, insights)
+    elif page == "Expiry Risk":
+        page_expiry_risk(df)
+    elif page == "Slow & Dead Stock":
+        page_slow_stock(df)
+    elif page == "SKU Drilldown":
+        page_sku_drill
